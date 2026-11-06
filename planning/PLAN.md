@@ -454,3 +454,69 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review: Questions, Clarifications & Simplifications
+
+*Added by doc review (2026-11-06). Cross-checked against the built market data code in `backend/app/market/`. Items are grouped by priority; each has a suggested default so implementation isn't blocked.*
+
+### A. Gaps that will block or confuse implementation
+
+1. **"Daily change %" has no data source.** The watchlist spec asks for daily change %, but `PriceUpdate.change_percent` is tick-to-tick (vs previous ~500ms price), and the simulator has no concept of a session open. **Suggest:** define daily change as change vs the seed price (simulator) / previous close (Massive), stored on the cache as `open_price`, and include it in the SSE payload. Or drop "daily" and show change since page load.
+2. **SSE payload shape differs from §6.** §6 implies one event per ticker; the built stream sends one event containing a dict of *all* tickers (`{"AAPL": {...}, "GOOGL": {...}}`), and only when the cache version changes. Document the actual shape here so the frontend agent codes against it.
+3. **Watchlist vs. price-source ticker set.** Not stated: when a ticker is removed from the watchlist but a position is still held, does it keep streaming? Without a price, portfolio valuation breaks. **Suggest:** the source tracks `watchlist ∪ held positions`; removing from the watchlist never removes a held ticker's price feed.
+4. **Ticker validation is unspecified.** What happens on `POST /api/watchlist {"ticker": "ZZZZ"}`? The simulator will happily invent a price for anything; Massive will return nothing. **Suggest:** uppercase + regex (`^[A-Z.]{1,10}$`); simulator accepts any valid symbol with a default seed price; Massive rejects tickers with no snapshot (404/422).
+5. **Trade price when no price is cached yet.** A trade on a just-added ticker may arrive before the first price. **Suggest:** reject with 409/422 "price unavailable".
+6. **Error response format.** No standard error shape. **Suggest:** FastAPI default `{"detail": "..."}` with 400 for validation failures (insufficient cash/shares), 404 for unknown ticker on DELETE.
+7. **Response schemas for REST endpoints are undefined.** `GET /api/portfolio`, `/api/portfolio/history`, `/api/watchlist`, and `/api/chat` need explicit JSON shapes — this is the frontend/backend contract and the most likely source of agent mismatch. **Suggest:** add a short example response for each.
+8. **Chat response `actions` shape.** The response must report per-action results (success/failure + error message), not just echo the LLM's request. Define e.g. `{"message": str, "trades": [{ticker, side, quantity, price?, status, error?}], "watchlist_changes": [{ticker, action, status, error?}]}`.
+9. **LLM failure handling.** What does `/api/chat` return if OpenRouter times out, the key is missing, or the output fails schema validation? **Suggest:** return 200 with a friendly assistant message and no actions; never 500 to the UI. Missing `OPENROUTER_API_KEY` with `LLM_MOCK=false` should log a warning at startup, not crash.
+10. **Conversation history length.** "Recent conversation history" — how many? **Suggest:** last 20 messages.
+11. **Mock LLM behavior.** E2E tests need the mock to produce a trade. Specify the deterministic rule, e.g. message containing "buy N TICKER" → that trade; otherwise a fixed reply with no actions.
+
+### B. Clarifications / inconsistencies
+
+12. **`users_profile` has no `user_id` column**, contradicting "All tables include a `user_id` column". Fine as-is (`id` *is* the user id) — just reword the sentence.
+13. **Position closing.** When a sell brings quantity to 0, delete the row (so it "disappears" per the E2E test). State this explicitly; also define a float epsilon (e.g. `< 1e-9` → 0) since fractional shares are allowed.
+14. **Average cost on sells.** Confirm: sells don't change `avg_cost`; buys use weighted average. Realized P&L isn't tracked anywhere — confirm that's intended (it isn't in the schema or UI).
+15. **Quantity validation.** Must be `> 0`; side must be `buy|sell`. Any minimum (e.g. 0.0001) or max precision?
+16. **Snapshot task with Massive.** On the free tier prices change every 15s, snapshots every 30s — fine, but note snapshots are taken even when nothing changed. Should snapshot history be capped/pruned? At 30s intervals it's ~2,900 rows/day — harmless for SQLite, but the history endpoint should probably downsample or limit.
+17. **"Lazy initialization on first request" vs "on startup".** §4 and §7 say different things. **Suggest:** initialize in the FastAPI lifespan at startup — simpler and the snapshot background task needs the DB anyway.
+18. **`.env` location in Docker.** §5 says backend reads `.env` from project root; §11 uses `--env-file`. Pick `--env-file` for Docker and `python-dotenv` (or uv's env loading) only for local dev.
+19. **Static file serving + client routing.** With a single page there's no routing, but state that FastAPI mounts `StaticFiles(directory="static", html=True)` *after* API routers so `/api/*` isn't shadowed.
+20. **Chart library.** "Lightweight Charts or Recharts" — Recharts is SVG, not canvas. Pick one: **Lightweight Charts** for price/P&L charts. The treemap needs something else (Recharts `Treemap` or a small hand-rolled squarify) — say which.
+21. **Header "total value updating live"** requires the frontend to compute value = cash + Σ(qty × live price) from SSE, rather than re-polling `/api/portfolio`. Confirm that's intended.
+22. **Minor code note:** `stream.py` declares `router` at module level and `create_stream_router()` decorates it, so calling the factory twice registers the route twice (matters in tests). Move `router = APIRouter(...)` inside the factory.
+
+### C. Opportunities to simplify
+
+23. **Drop `id` UUIDs where a natural key exists.** `watchlist` and `positions` already have `UNIQUE(user_id, ticker)`; making that the primary key removes UUID generation and simplifies upserts (`INSERT ... ON CONFLICT`). Keep UUIDs only for append-only tables (or use `INTEGER PRIMARY KEY AUTOINCREMENT` there too).
+24. **Store cash in `users_profile` only** — already the case; avoid any temptation to derive cash from the trade log.
+25. **Skip the `docker-compose.yml`** at the root — the start scripts cover it and it's one more thing to keep in sync. Keep only `test/docker-compose.test.yml`.
+26. **Windows scripts.** Unless Windows users are a confirmed audience, a single `docker run` line in the README may suffice; otherwise keep them trivially thin.
+27. **E2E infra.** Running Playwright from the host (`npx playwright test` against `localhost:8000`) is simpler than a Playwright container in compose. Consider the container only for CI.
+28. **Frontend unit tests.** Scope down to the logic most likely to break (portfolio math, SSE parsing, flash-trigger). Component rendering tests for every panel add little for a demo app.
+29. **`portfolio_snapshots` table is optional.** The P&L chart could be computed client-side from SSE since page load (like sparklines), dropping the table and the background task. Recommendation: keep the table — a chart that survives reloads is a nicer demo — but this is the cut to make if time is short.
+30. **SSE dict payload is good** — keeping "all prices in one event" (as built) is simpler for the frontend than per-ticker events; just document it (see #2).
+
+### D. Open questions for the project owner
+
+- Should the AI be allowed to trade tickers not on the watchlist (auto-adding them)?
+- Is there a cap on position size or any "risk" guardrail for AI trades, or is anything within cash allowed?
+- Is a "reset portfolio" action wanted for demos?
+- Should chat history persist across reloads in the UI (load from `chat_messages` on page load)? Implied but not stated — needs a `GET /api/chat/history` endpoint if so.
+
+### E. Second pass — additional items
+
+31. **Timestamp formats are mixed.** SSE `timestamp` is Unix seconds (float); every DB column is an ISO string. **Suggest:** keep both but state it explicitly — ISO 8601 UTC with `Z` in the DB and REST, Unix seconds only in SSE (cheap for charts).
+32. **Price/quantity rounding.** Trades fill at the cached float price (e.g. `190.48731`). **Suggest:** round fill prices to 2 dp and cash to 2 dp on write; quantities to 4 dp. Otherwise P&L displays drift and tests get flaky.
+33. **Concurrent trades.** Manual trades and chat-driven trades can race on cash/position reads. **Suggest:** run each trade in a single SQLite transaction (`BEGIN IMMEDIATE`) or behind an `asyncio.Lock` — one line, prevents double-spend.
+34. **Manual trades on tickers not in the watchlist.** Allowed? If yes, the ticker has no price yet (see #5). **Suggest:** a buy auto-adds the ticker to the watchlist (and the price source) — same rule for AI and manual trades.
+35. **"Manage the watchlist proactively" + auto-execution** means the AI may add/remove tickers the user never asked about. **Suggest:** proactive *suggestions* only; execute watchlist changes when asked — or accept it and say so.
+36. **Heatmap details.** Is cash shown as a tile? What P&L % maps to full green/red? **Suggest:** exclude cash; color scale clamps at ±5%; empty state when no positions.
+37. **`GET /api/watchlist` "with latest prices"** duplicates SSE. **Simplify:** return tickers only (or include the cached price just for the first paint) — the frontend gets prices from SSE anyway.
+38. **Sparkline/chart memory.** Data accumulates from SSE at 2 Hz forever. **Suggest:** cap client-side buffers (e.g. last 600 points ≈ 5 min per ticker).
+39. **`GET /api/health` response.** Define it, e.g. `{"status": "ok"}`, and use it in the Dockerfile `HEALTHCHECK` and E2E wait step.
+40. **Static export path.** Next.js `output: 'export'` writes to `frontend/out/`; the Dockerfile should copy `out/` → `backend/static/`. Worth stating since it's a classic agent mismatch.
+41. **Structured output support.** Confirm `gpt-oss-120b` on Cerebras via OpenRouter honors `response_format` JSON schema; if not, the fallback is "JSON mode + Pydantic validation + one retry". Document which approach is used so the LLM and test agents agree.
